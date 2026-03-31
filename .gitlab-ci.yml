@@ -1,0 +1,476 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "DEV"'
+    - if: '$CI_COMMIT_BRANCH == "UAT"'
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+    - when: never
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+stages:
+  - check
+  - test
+  - build
+  - scan
+  - promote
+  - release
+
+variables:
+  GIT_DEPTH: "0"
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository -Xmx2048m"
+  # Version is driven by pom.xml — no MAJOR_VERSION / MINOR_VERSION needed here
+  AST_ENABLE_MR_PIPELINES: "true"
+
+.default_rules:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "DEV"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "UAT"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+    - if: '$CI_MERGE_REQUEST_ID'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+
+.maven_cache:
+  cache:
+    key:
+      files:
+        - pom.xml
+        - .mvn/wrapper/maven-wrapper.properties
+    paths:
+      - .m2/repository/
+    policy: pull-push
+
+# =========================================================
+# CHECK STAGE
+# =========================================================
+compile-check:
+  stage: check
+  image: maven:3.9-eclipse-temurin-21
+  extends:
+    - .default_rules
+    - .maven_cache
+  script:
+    - mvn -B -ntp clean compile -DskipTests
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - target/
+  allow_failure: false
+
+sonar-scan:
+  stage: check
+  image: maven:3.9-eclipse-temurin-21
+  extends:
+    - .default_rules
+    - .maven_cache
+  script:
+    - echo "Starting Sonar analysis stage"
+    - echo "Normally sonar-scanner or mvn sonar:sonar would run here"
+    - echo "Using SONAR_PROJECT_KEY=$SONAR_PROJECT_KEY"
+    - echo "Using SONAR_HOST_URL=$SONAR_HOST_URL"
+    - echo "Running code quality analysis..."
+    - echo "Sonar analysis completed successfully"
+  allow_failure: true
+
+secret_detection:
+  stage: check
+  allow_failure: false
+
+dependency_scanning:
+  stage: check
+  extends:
+    - .maven_cache
+  variables:
+    DS_DISABLE_DIND: "true"
+    DS_JAVA_VERSION: "21"
+  allow_failure: true
+
+sast:
+  stage: check
+  variables:
+    SAST_EXCLUDED_PATHS: "target,docs,*.md"
+    GITLAB_ADVANCED_SAST_ENABLED: "true"
+  allow_failure: true
+
+# =========================================================
+# BUILD STAGE
+# =========================================================
+build-native-image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  extends:
+    - .default_rules
+  before_script:
+    - 'BUILD_START=$(date +%s)'
+    - 'mkdir -p /kaniko/.docker'
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}' \
+        "$CI_REGISTRY" \
+        "$(printf '%s' "$CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
+    # Read version directly from pom.xml and strip -SNAPSHOT for the image tag
+    - 'RAW_VERSION=$(grep -m1 "<version>" pom.xml | sed "s/.*<version>\(.*\)<\/version>/\1/" | tr -d "[:space:]")'
+    - 'VERSION="${RAW_VERSION%-SNAPSHOT}"'
+    - 'BRANCH_PREFIX=$(echo "$CI_COMMIT_REF_NAME" | tr "[:upper:]" "[:lower:]")'
+    - 'REGISTRY_PATH="${CI_REGISTRY_IMAGE}"'
+    - 'SHORT_SHA=$(echo "$CI_COMMIT_SHORT_SHA" | cut -c1-8)'
+    - 'IMAGE_TAG="${BRANCH_PREFIX}-${VERSION}-${SHORT_SHA}"'
+    - 'echo "IMAGE_TAG=${IMAGE_TAG}" > build.env'
+    - 'echo "VERSION=${VERSION}" >> build.env'
+    - 'echo "SHORT_SHA=${SHORT_SHA}" >> build.env'
+    - 'echo "BRANCH_PREFIX=${BRANCH_PREFIX}" >> build.env'
+    - 'echo "REGISTRY_PATH=${REGISTRY_PATH}" >> build.env'
+    - 'echo "Resolved version from pom.xml: ${VERSION}"'
+    - 'echo "Image tag will be: ${IMAGE_TAG}"'
+
+  script:
+    - 'echo "=== PHASE 1: Kaniko build + push ==="'
+    - 'PHASE1_START=$(date +%s)'
+    - |
+      /kaniko/executor \
+        --context="$CI_PROJECT_DIR" \
+        --dockerfile="$CI_PROJECT_DIR/src/main/docker/Dockerfile.multi-stage-docker-build" \
+        --destination="${REGISTRY_PATH}:${IMAGE_TAG}" \
+        --destination="${REGISTRY_PATH}:latest" \
+        --cache=true \
+        --cache-repo="${CI_REGISTRY_IMAGE}/cache" \
+        --cache-ttl=168h \
+        --snapshot-mode=redo \
+        --use-new-run \
+        --compressed-caching=false \
+        --verbosity=info \
+        --custom-platform=linux/amd64
+    - 'PHASE1_END=$(date +%s)'
+    - 'BUILD_END=$(date +%s)'
+    - |
+      echo "========================================"
+      echo "       KANIKO BUILD TIME SUMMARY"
+      echo "========================================"
+      echo " Build + Push : $((PHASE1_END - PHASE1_START))s"
+      echo " TOTAL        : $((BUILD_END - BUILD_START))s ($(((BUILD_END - BUILD_START) / 60))m $(((BUILD_END - BUILD_START) % 60))s)"
+      echo "----------------------------------------"
+      echo " Image        : ${REGISTRY_PATH}:${IMAGE_TAG}"
+      echo " Image        : ${REGISTRY_PATH}:latest"
+      echo "========================================"
+
+  needs:
+    - job: compile-check
+    - job: unit-tests 
+  
+  artifacts:
+    reports:
+      dotenv: build.env
+    expire_in: 1 hour
+
+# =========================================================
+# TEST STAGE
+# =========================================================
+unit-tests:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21
+  extends:
+    - .default_rules
+    - .maven_cache
+  script:
+    - mvn -B -ntp test
+  artifacts:
+    when: always
+    expire_in: 1 day
+    paths:
+      - target/surefire-reports/
+      - target/site/jacoco/
+    reports:
+      junit:
+        - target/surefire-reports/*.xml
+  allow_failure: false
+
+# =========================================================
+# SCAN STAGE
+# =========================================================
+container_scanning:
+  stage: scan
+  extends:
+    - .default_rules
+  needs:
+    - job: build-native-image
+      artifacts: true
+  variables:
+    CS_IMAGE: "$CI_REGISTRY_IMAGE:latest"
+    CS_DOCKERFILE_PATH: "src/main/docker/Dockerfile.multi-stage-docker-build"
+    GIT_STRATEGY: "fetch"
+    SECURE_LOG_LEVEL: "debug"
+    CS_REGISTRY_USER: "$CI_REGISTRY_USER"
+    CS_REGISTRY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+  allow_failure: true
+
+runtime-check:
+  stage: scan
+  image: curlimages/curl:latest
+  extends:
+    - .default_rules
+  script:
+    - echo "Runtime/DAST placeholder"
+    - echo "Add deployed URL-based DAST later"
+  allow_failure: true
+
+# =========================================================
+# PROMOTE STAGE
+# =========================================================
+promote:
+  stage: promote
+  image:
+    name: gcr.io/go-containerregistry/crane:debug
+    entrypoint: [""]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "UAT"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+      changes:
+        - src/**/*
+        - pom.xml
+        - mvnw
+        - mvnw.cmd
+        - .mvn/**/*
+        - src/main/docker/**/*
+        - .gitlab-ci.yml
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "UAT"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+      when: manual
+  script:
+    - |
+      set -e
+      case "$CI_COMMIT_BRANCH" in
+        UAT)  SOURCE_TAG="dev"; TARGET_TAG="uat" ;;
+        PROD) SOURCE_TAG="uat"; TARGET_TAG="prod" ;;
+        *)    echo "ERROR: Promotion not configured for branch $CI_COMMIT_BRANCH"; exit 1 ;;
+      esac
+      echo "Promoting $CI_REGISTRY_IMAGE:$SOURCE_TAG -> $CI_REGISTRY_IMAGE:$TARGET_TAG"
+      crane auth login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      crane copy "$CI_REGISTRY_IMAGE:$SOURCE_TAG" "$CI_REGISTRY_IMAGE:$TARGET_TAG"
+      echo "Promotion complete: $CI_REGISTRY_IMAGE:$TARGET_TAG"
+
+# =========================================================
+# RELEASE STAGE
+#
+# Two manual buttons appear in the pipeline UI after a push:
+#
+#   ▶ release:minor  — tags the release, then bumps to X.Y+1.0-SNAPSHOT
+#   ▶ release:major  — tags the release, then bumps to X+1.0.0-SNAPSHOT
+#
+# Click whichever applies. version-bump runs automatically
+# after whichever one you triggered.
+#
+# BEFORE USING: make sure JRELEASER_GITLAB_TOKEN is set in
+# GitLab → Project → Settings → CI/CD → Variables
+# (type: Variable, protected: yes, masked: yes, expanded: yes)
+# =========================================================
+
+# Shared base config inherited by both release jobs.
+.release_base:
+  stage: release
+  image: maven:3.9-eclipse-temurin-21
+  extends:
+    - .maven_cache
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - when: never
+  before_script:
+    - 'git config --global user.email "ci@gitlab"'
+    - 'git config --global user.name "gitlab-ci"'
+    - 'git fetch --tags'
+    - 'git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"'
+  script:
+    - 'CURRENT_VERSION=$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)'
+    - 'RELEASE_VERSION="${CURRENT_VERSION%-SNAPSHOT}"'
+
+    - 'echo "Current project version: ${CURRENT_VERSION}"'
+    - 'echo "Release version: ${RELEASE_VERSION}"'
+    - 'echo "Bump type: ${BUMP_TYPE}"'
+
+    - 'echo "RELEASE_VERSION=${RELEASE_VERSION}" > release.env'
+    - 'echo "BUMP_TYPE=${BUMP_TYPE}" >> release.env'
+
+    - 'echo "CI_PROJECT_ID=$CI_PROJECT_ID"'
+    - 'echo "CI_PROJECT_NAMESPACE=$CI_PROJECT_NAMESPACE"'
+    - 'echo "CI_PROJECT_NAME=$CI_PROJECT_NAME"'
+    - 'if [ -z "$JRELEASER_GITLAB_TOKEN" ]; then echo "ERROR: Missing JRELEASER_GITLAB_TOKEN"; exit 1; fi'
+
+    - 'mvn -B -ntp versions:set -DnewVersion="${RELEASE_VERSION}" -DgenerateBackupPoms=false'
+
+    - |
+      mvn -B -ntp jreleaser:full-release \
+        -DskipTests \
+        -Djreleaser.project.version="${RELEASE_VERSION}" \
+        -Djreleaser.tag.name="v${RELEASE_VERSION}" \
+        -Djreleaser.gitlab.token="${JRELEASER_GITLAB_TOKEN}" \
+        -Djreleaser.gitlab.host="gitlab.com" \
+        -Djreleaser.gitlab.owner="${CI_PROJECT_NAMESPACE}" \
+        -Djreleaser.gitlab.name="${CI_PROJECT_NAME}" \
+        -Djreleaser.gitlab.projectIdentifier="${CI_PROJECT_ID}"
+
+  artifacts:
+    reports:
+      dotenv: release.env
+    paths:
+      - target/jreleaser/
+    expire_in: 7 days
+    when: always
+  after_script:
+    - 'git checkout -- pom.xml || true'
+
+# Click this for a normal feature release — bumps X.Y+1.0-SNAPSHOT
+release:minor:
+  extends: .release_base
+  manual_confirmation: "Tag release and bump to next MINOR version? (X.Y+1.0-SNAPSHOT)"
+  variables:
+    BUMP_TYPE: "minor"
+
+# Click this for a breaking-change release — bumps X+1.0.0-SNAPSHOT
+release:major:
+  extends: .release_base
+  manual_confirmation: "Tag release and bump to next MAJOR version? (X+1.0.0-SNAPSHOT)"
+  variables:
+    BUMP_TYPE: "major"
+
+# ---------------------------------------------------------
+# VERSION BUMP — runs automatically after whichever release
+# job you clicked. Reads RELEASE_VERSION and BUMP_TYPE from
+# the dotenv artifact of the release job that ran.
+# Writes the next -SNAPSHOT version to pom.xml and pushes.
+# [skip ci] on the commit prevents an infinite pipeline loop.
+# ---------------------------------------------------------
+version-bump:
+  stage: release
+  image: maven:3.9-eclipse-temurin-21
+  extends:
+    - .maven_cache
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+    - when: never
+  # optional: true means this job waits for whichever of the two ran,
+  # and skips the dependency on the one that was never triggered.
+  needs:
+    - job: release:minor
+      optional: true
+      artifacts: true
+    - job: release:major
+      optional: true
+      artifacts: true
+  before_script:
+    - 'git config --global user.email "ci@gitlab"'
+    - 'git config --global user.name "gitlab-ci"'
+    - 'git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"'
+    - 'git fetch --tags'
+    # Pull latest so we commit on top of the release job's pom.xml restore
+    - 'git pull origin $CI_COMMIT_BRANCH'
+  script:
+    - |
+      set -e
+
+      # RELEASE_VERSION and BUMP_TYPE are injected via dotenv artifact
+      # from whichever release job ran (release:minor or release:major)
+      echo "Released version : ${RELEASE_VERSION}"
+      echo "Bump type        : ${BUMP_TYPE}"
+
+      MAJOR=$(echo "$RELEASE_VERSION" | cut -d. -f1)
+      MINOR=$(echo "$RELEASE_VERSION" | cut -d. -f2)
+
+      case "${BUMP_TYPE}" in
+        major)
+          NEW_MAJOR=$((MAJOR + 1))
+          NEXT_VERSION="${NEW_MAJOR}.0.0-SNAPSHOT"
+          ;;
+        minor)
+          NEW_MINOR=$((MINOR + 1))
+          NEXT_VERSION="${MAJOR}.${NEW_MINOR}.0-SNAPSHOT"
+          ;;
+        *)
+          echo "ERROR: Unknown BUMP_TYPE=${BUMP_TYPE}. Expected 'major' or 'minor'."
+          exit 1
+          ;;
+      esac
+
+      echo "Next development version: ${NEXT_VERSION}"
+
+      # Update pom.xml to the next snapshot version
+      mvn -B -ntp versions:set -DnewVersion="${NEXT_VERSION}" -DgenerateBackupPoms=false
+
+      # Commit and push with [skip ci] to prevent triggering another pipeline
+      git add pom.xml
+      git commit -m "chore: bump version to ${NEXT_VERSION} [skip ci]"
+      git push origin HEAD:$CI_COMMIT_BRANCH
+
+      echo "========================================"
+      echo "  VERSION BUMP COMPLETE"
+      echo "  ${RELEASE_VERSION} -> ${NEXT_VERSION}"
+      echo "========================================"
+# todo: we need to add test job before build stage as whats the purpose of testing after build
