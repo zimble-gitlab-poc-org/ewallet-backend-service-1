@@ -6,7 +6,7 @@ workflow:
     - if: '$CI_COMMIT_BRANCH == "DEV"'
     - if: '$CI_COMMIT_BRANCH == "UAT"'
     - if: '$CI_COMMIT_BRANCH == "PROD"'
-    - when: never
+    - if: '$CI_COMMIT_BRANCH'   # catch-all: allows pipelines on PR/feature branches
 
 include:
   - template: Security/SAST.gitlab-ci.yml
@@ -155,6 +155,8 @@ build-native-image:
   image:
     name: gcr.io/kaniko-project/executor:v1.23.2-debug
     entrypoint: [""]
+  tags:
+    - kaniko   # scoped here only — not applied globally via default
   extends:
     - .default_rules
   before_script:
